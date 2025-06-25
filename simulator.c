@@ -1,211 +1,420 @@
+// simulator.c
+
 #include "simulator.h"
+#include "gui.h" // For logging and GUI updates
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>
+#include <time.h>
+#include <math.h>
 
-static long global_access_time = 0; // Used by LRU to track access order
+long global_access_time = 0;
 
-// Initializes the simulator with default settings
-void simulator_init(Simulator *sim) {
-    sim->page_size = 4096;
-    sim->process_count = 1;
-    memset(sim->process_sizes, 0, sizeof(sim->process_sizes));
-    strcpy(sim->algorithm, "lru");
-    memset(sim->memory, 0, sizeof(sim->memory));
-    sim->memory_usage = 0;
-    sim->reference_string_len = 0;
-    global_access_time = 0;
-}
-
-// Sets the page replacement algorithm
-void simulator_set_algorithm(Simulator *sim, const char *algorithm) {
-    strncpy(sim->algorithm, algorithm, sizeof(sim->algorithm) - 1);`
-    sim->algorithm[sizeof(sim->algorithm) - 1] = '\0';
-}
-
-// Sets the page size (default fallback is 4096)
-void simulator_set_page_size(Simulator *sim, int page_size) {
-    sim->page_size = page_size > 0 ? page_size : 4096;
-}
-
-// Sets the number of processes
-void simulator_set_process_count(Simulator *sim, int count) {
-    sim->process_count = (count > 0 && count <= MAX_PROCESSES) ? count : 1;
-}
-
-// Sets the memory size required by a specific process
-void simulator_set_process_size(Simulator *sim, int index, int size) {
-    if (index >= 0 && index < MAX_PROCESSES)
-        sim->process_sizes[index] = size;
-}
-
-// Checks if a page is in memory; updates access time if LRU
-static int is_page_in_memory(Simulator *sim, int pid, int page) {
+// Finds if a process is in memory, returns its index in sim->memory array if found, -1 otherwise.
+// Now checks for process_id, not just size.
+static int is_process_in_memory(Simulator *sim, int process_id) {
     for (int i = 0; i < sim->memory_usage; i++) {
-        if (sim->memory[i].process_id == pid && sim->memory[i].page == page) {
-            if (strcmp(sim->algorithm, "lru") == 0) {
-                sim->memory[i].last_access_time = global_access_time;
-            }
-            return sim->memory[i].frame;
+        if (sim->memory[i].occupied && sim->memory[i].process_id == process_id) {
+            return i;
         }
     }
     return -1;
 }
 
-// Applies selected page replacement algorithm and evicts a page
-static int evict_page(Simulator *sim, char *log_output, int current_ref_idx) {
-    int victim_frame_idx = -1;
-    char msg[100];
+// Finds the index of the victim page in the sim->memory array based on algorithm
+static int find_victim_frame_index(Simulator *sim, int current_ref_idx) {
+    if (sim->memory_usage == 0) {
+        return -1;
+    }
 
     if (strcmp(sim->algorithm, "fifo") == 0) {
-        // FIFO: Evict the first page loaded
-        victim_frame_idx = 0;
-
+        return 0; // FIFO evicts the oldest page (which is at index 0 after shifts)
     } else if (strcmp(sim->algorithm, "lru") == 0) {
-        // LRU: Evict the page with the smallest access time
-        long min_access_time = LONG_MAX;
+        long min_time = -1;
+        int lru_idx = -1;
         for (int i = 0; i < sim->memory_usage; i++) {
-            if (sim->memory[i].last_access_time < min_access_time) {
-                min_access_time = sim->memory[i].last_access_time;
-                victim_frame_idx = i;
+            if (sim->memory[i].occupied) {
+                if (lru_idx == -1 || sim->memory[i].last_access_time < min_time) {
+                    min_time = sim->memory[i].last_access_time;
+                    lru_idx = i;
+                }
             }
         }
-
+        return lru_idx;
     } else if (strcmp(sim->algorithm, "optimal") == 0) {
-        // Optimal: Evict the page with the farthest next use or never used again
-        int farthest_future_use = -1;
-        int page_to_evict_mem_idx = -1;
+        int optimal_idx = -1;
+        int farthest_future_idx = -1;
 
         for (int i = 0; i < sim->memory_usage; i++) {
-            int pid = sim->memory[i].process_id;
-            int page = sim->memory[i].page;
-            int next_use_idx = INT_MAX;
+            if (!sim->memory[i].occupied) continue;
 
-            for (int k = current_ref_idx + 1; k < sim->reference_string_len; k++) {
-                if (sim->reference_string[k].pid == pid &&
-                    sim->reference_string[k].page_num == page) {
-                    next_use_idx = k;
+            int current_process_id = sim->memory[i].process_id;
+            int next_use_idx = -1;
+
+            // Search for the next access of this process_id in the *remaining* reference string
+            for (int j = current_ref_idx + 1; j < sim->reference_string_len; j++) {
+                if (sim->reference_string[j].process_id == current_process_id) {
+                    next_use_idx = j;
                     break;
                 }
             }
 
-            if (next_use_idx == INT_MAX) {
-                page_to_evict_mem_idx = i;
-                break;
-            } else if (next_use_idx > farthest_future_use) {
-                farthest_future_use = next_use_idx;
-                page_to_evict_mem_idx = i;
+            // If a page will not be used again, it's the optimal victim
+            if (next_use_idx == -1) {
+                return i;
+            }
+
+            // Otherwise, choose the page whose next use is farthest in the future
+            if (next_use_idx > farthest_future_idx) {
+                farthest_future_idx = next_use_idx;
+                optimal_idx = i;
             }
         }
-        victim_frame_idx = page_to_evict_mem_idx;
-    } else {
-        // Fallback: default to FIFO
-        victim_frame_idx = 0;
+        return optimal_idx;
     }
-
-    PageFrame victim = sim->memory[victim_frame_idx];
-    snprintf(msg, sizeof(msg), "Page-Out: Process %d Page %d from Frame %d (Algorithm: %s)\n",
-             victim.process_id, victim.page, victim.frame, sim->algorithm);
-    strcat(log_output, msg);
-
-    int freed_frame = victim.frame;
-
-    // Remove victim from memory and shift remaining frames
-    for (int i = victim_frame_idx; i < sim->memory_usage - 1; i++) {
-        sim->memory[i] = sim->memory[i + 1];
-    }
-    sim->memory_usage--;
-
-    return freed_frame;
+    return -1;
 }
 
-// Loads a page into memory; triggers eviction if memory full
-static void load_page(Simulator *sim, int pid, int page, char *log_output, int current_ref_idx) {
-    int frame;
-    char msg[100];
+// Loads a process into memory (handles page-in and page-out if necessary)
+// Now takes process_id and its kb_size
+static void load_process(Simulator *sim, int process_id, int process_kb_size, int current_ref_idx) {
+    char log_msg[128];
+    int physical_frame_assigned = -1;
 
     if (sim->memory_usage < FRAME_COUNT) {
-        frame = sim->memory_usage;
+        // Memory not full, simply add to the next available slot
+        physical_frame_assigned = sim->memory_usage; // This assumes sequential filling initially
+
+        sim->memory[sim->memory_usage].process_id = process_id;
+        sim->memory[sim->memory_usage].process_kb_size = process_kb_size;
+        sim->memory[sim->memory_usage].frame = physical_frame_assigned; // Assigns a specific frame index
+        sim->memory[sim->memory_usage].last_access_time = global_access_time;
+        sim->memory[sim->memory_usage].occupied = true;
+        sim->memory_usage++;
+
+        snprintf(log_msg, sizeof(log_msg), "Page-In: Process ID %d (Size %d KB) -> Frame %d (Memory not full)\n",
+                 process_id, process_kb_size, physical_frame_assigned);
+        gui_log_message(log_msg);
+
+        sim->last_highlight_frame = physical_frame_assigned;
+        sim->last_highlight_type = 2; // Green highlight for page-in
     } else {
-        // Perform eviction using selected page replacement algorithm
-        frame = evict_page(sim, log_output, current_ref_idx);
+        // Memory is full, find a victim using the replacement algorithm
+        int victim_mem_array_idx = find_victim_frame_index(sim, current_ref_idx);
+
+        if (victim_mem_array_idx < 0 || victim_mem_array_idx >= sim->memory_usage || !sim->memory[victim_mem_array_idx].occupied) {
+            fprintf(stderr, "Error: Invalid victim_mem_array_idx %d for memory_usage %d. Skipping page-in.\n", victim_mem_array_idx, sim->memory_usage);
+            sim->last_highlight_frame = -1;
+            sim->last_highlight_type = 0;
+            return;
+        }
+
+        PageFrame victim_page = sim->memory[victim_mem_array_idx];
+        physical_frame_assigned = victim_page.frame; // The frame number of the evicted page
+
+        snprintf(log_msg, sizeof(log_msg), "Page-Out: Process ID %d (Size %d KB) from Frame %d (Algorithm: %s)\n",
+                 victim_page.process_id, victim_page.process_kb_size, victim_page.frame, sim->algorithm);
+        gui_log_message(log_msg);
+
+        sim->last_highlight_frame = physical_frame_assigned;
+        sim->last_highlight_type = 3; // Red highlight for page-out
+        gui_update_memory_display(sim, sim->last_highlight_frame, sim->last_highlight_type);
+        g_usleep(100000); // Small delay to show eviction before new page comes in
+
+        // Remove the victim page from the memory array by shifting elements
+        for (int i = victim_mem_array_idx; i < sim->memory_usage - 1; i++) {
+            sim->memory[i] = sim->memory[i + 1];
+        }
+        sim->memory_usage--; // Decrement usage after removing victim
+
+        // Insert the new page at the end of the logical memory array
+        sim->memory[sim->memory_usage].process_id = process_id;
+        sim->memory[sim->memory_usage].process_kb_size = process_kb_size;
+        sim->memory[sim->memory_usage].frame = physical_frame_assigned; // Reassign the freed frame
+        sim->memory[sim->memory_usage].last_access_time = global_access_time;
+        sim->memory[sim->memory_usage].occupied = true;
+        sim->memory_usage++;
+
+        snprintf(log_msg, sizeof(log_msg), "Page-In:  Process ID %d (Size %d KB) -> Frame %d\n",
+                 process_id, process_kb_size, physical_frame_assigned);
+        gui_log_message(log_msg);
+
+        sim->last_highlight_frame = physical_frame_assigned;
+        sim->last_highlight_type = 2; // Green highlight for page-in
     }
-
-    sim->memory[sim->memory_usage].process_id = pid;
-    sim->memory[sim->memory_usage].page = page;
-    sim->memory[sim->memory_usage].frame = frame;
-    sim->memory[sim->memory_usage].last_access_time = global_access_time;
-
-    sim->memory_usage++;
-
-    snprintf(msg, sizeof(msg), "Page-In:  Process %d Page %d -> Frame %d\n", pid, page, frame);
-    strcat(log_output, msg);
 }
 
-// Executes the simulation of memory accesses with page replacement
-void simulator_run(Simulator *sim, char *log_output) {
+
+// --- Simulator Public Functions ---
+
+void simulator_init(Simulator *sim) {
+    sim->frame_size = 0;
+    sim->frame_count = FRAME_COUNT;
     sim->memory_usage = 0;
-    memset(sim->memory, 0, sizeof(sim->memory));
+    sim->page_faults = 0;
+    sim->page_hits = 0;
+    sim->reference_string = NULL;
+    sim->reference_string_len = 0;
+    sim->current_ref_idx = 0;
+    sim->last_highlight_frame = -1;
+    sim->last_highlight_type = 0;
+    strcpy(sim->algorithm, "fifo");
+
+    sim->defined_processes_count = 0;
+
+    for (int i = 0; i < FRAME_COUNT; i++) {
+        sim->memory[i].process_id = -1; // Initialize new field
+        sim->memory[i].process_kb_size = -1; // Initialize new field
+        sim->memory[i].frame = i;
+        sim->memory[i].last_access_time = 0;
+        sim->memory[i].occupied = false;
+    }
     global_access_time = 0;
+    srand(time(NULL)); // Seed random for potential future use (though not directly used for algo here)
+}
+
+void simulator_configure_params(Simulator *sim, int frame_size_kb, const char *algo, int num_defined_processes) {
+    sim->frame_size = frame_size_kb; // Store frame size in KB
+    strcpy(sim->algorithm, algo);
+    if (num_defined_processes < 1 || num_defined_processes > MAX_UNIQUE_PAGES_TO_DEFINE) {
+        sim->defined_processes_count = 4; // Default if invalid
+        gui_log_message("Warning: Invalid number of unique processes defined. Capped at 4.\n");
+    } else {
+        sim->defined_processes_count = num_defined_processes;
+    }
+}
+
+// Renamed and logic updated for processes
+void simulator_set_defined_process_size(Simulator *sim, int process_idx, int size_kb) {
+    if (process_idx >= 0 && process_idx < sim->defined_processes_count) {
+        sim->defined_process_kb_sizes[process_idx] = size_kb;
+    } else {
+        fprintf(stderr, "Error: Attempted to set size for invalid defined process index %d.\n", process_idx);
+    }
+}
+
+// Parses the input string into the reference string of ProcessReferences
+bool simulator_prepare_run_from_string(Simulator *sim, const char *ref_string_input_str) {
+    if (sim->reference_string != NULL) {
+        free(sim->reference_string);
+        sim->reference_string = NULL;
+    }
+
+    sim->page_faults = 0;
+    sim->page_hits = 0;
+    sim->current_ref_idx = 0;
+    global_access_time = 0;
+
+    // Reset memory state
+    for (int i = 0; i < FRAME_COUNT; i++) {
+        sim->memory[i].process_id = -1;
+        sim->memory[i].process_kb_size = -1;
+        sim->memory[i].frame = i;
+        sim->memory[i].last_access_time = 0;
+        sim->memory[i].occupied = false;
+    }
+    sim->memory_usage = 0;
+    sim->last_highlight_frame = -1;
+    sim->last_highlight_type = 0;
+
+    if (sim->defined_processes_count == 0) {
+        gui_log_message("Error: No unique processes defined. Cannot generate reference string.\n");
+        return false;
+    }
+
+    // Parse the comma-separated string
+    char *input_copy = strdup(ref_string_input_str); // Duplicate to safely tokenize
+    if (input_copy == NULL) {
+        gui_log_message("Error: Memory allocation failed for reference string parsing.\n");
+        return false;
+    }
+
+    int count = 0;
+    char *token = strtok(input_copy, ",");
+    // First pass to count tokens (number of accesses)
+    while (token != NULL) {
+        count++;
+        token = strtok(NULL, ",");
+    }
+    free(input_copy); // Free the first duplicated string
+
+    if (count == 0) {
+        gui_log_message("Error: Reference string is empty or invalid format.\n");
+        return false;
+    }
+
+    sim->reference_string_len = count;
+    sim->reference_string = (ProcessReference*)malloc(sim->reference_string_len * sizeof(ProcessReference));
+    if (sim->reference_string == NULL) {
+        gui_log_message("Error: Failed to allocate memory for reference string.\n");
+        sim->reference_string_len = 0;
+        return false;
+    }
+
+    // Second pass to populate the reference string array
+    input_copy = strdup(ref_string_input_str); // Duplicate again for the second pass
+    if (input_copy == NULL) {
+        gui_log_message("Error: Memory allocation failed for reference string parsing (second pass).\n");
+        free(sim->reference_string);
+        sim->reference_string = NULL;
+        sim->reference_string_len = 0;
+        return false;
+    }
+
+    int ref_idx = 0;
+    token = strtok(input_copy, ",");
+    while (token != NULL && ref_idx < sim->reference_string_len) {
+        int process_idx_from_string = atoi(token); // Convert string token to integer index (which is process_id)
+
+        // Validate the index against the number of defined unique processes
+        if (process_idx_from_string < 0 || process_idx_from_string >= sim->defined_processes_count) {
+            gui_log_message("Error: Invalid process ID '%d' found in reference string. Must be between 0 and %d.\n", process_idx_from_string, sim->defined_processes_count - 1);
+            free(sim->reference_string);
+            sim->reference_string = NULL;
+            sim->reference_string_len = 0;
+            free(input_copy);
+            return false;
+        }
+
+        // Assign the process_id and its actual KB size from the defined processes array
+        sim->reference_string[ref_idx].process_id = process_idx_from_string;
+        sim->reference_string[ref_idx].process_kb_size = sim->defined_process_kb_sizes[process_idx_from_string];
+        ref_idx++;
+        token = strtok(NULL, ",");
+    }
+    free(input_copy); // Free the duplicated string
+
+    char log_msg[256];
+    snprintf(log_msg, sizeof(log_msg), "Reference String Parsed. Total Accesses: %d\n", sim->reference_string_len);
+    gui_log_message(log_msg);
+
+    // Log the configuration for clarity
+    snprintf(log_msg, sizeof(log_msg),
+             "Algorithm: %s\n"
+             "Frame Size: %d KB\n"
+             "Unique Processes Defined: %d\n",
+             sim->algorithm, sim->frame_size, sim->defined_processes_count);
+    gui_log_message(log_msg);
+
+    for (int i = 0; i < sim->defined_processes_count; i++) {
+        snprintf(log_msg, sizeof(log_msg), "Process %d (Size: %d KB)\n",
+                 i, sim->defined_process_kb_sizes[i]);
+        gui_log_message(log_msg);
+    }
+    snprintf(log_msg, sizeof(log_msg), "Input Reference String: %s\n", ref_string_input_str);
+    gui_log_message(log_msg);
+
+
+    return true;
+}
+
+
+void simulator_reset(Simulator *sim) {
+    sim->page_faults = 0;
+    sim->page_hits = 0;
+    sim->current_ref_idx = 0;
+    global_access_time = 0;
+
+    for (int i = 0; i < FRAME_COUNT; i++) {
+        sim->memory[i].process_id = -1; // Reset new field
+        sim->memory[i].process_kb_size = -1; // Reset new field
+        sim->memory[i].frame = i;
+        sim->memory[i].last_access_time = 0;
+        sim->memory[i].occupied = false;
+    }
+    sim->memory_usage = 0;
+    sim->last_highlight_frame = -1;
+    sim->last_highlight_type = 0;
+
+    if (sim->reference_string != NULL) {
+        free(sim->reference_string);
+        sim->reference_string = NULL;
+    }
     sim->reference_string_len = 0;
 
-    // Generate reference string based on process sizes
-    for (int pid = 0; pid < sim->process_count; pid++) {
-        int num_pages = (sim->process_sizes[pid] * 1024) / sim->page_size;
-        for (int page = 0; page < num_pages; page++) {
-            if (sim->reference_string_len < MAX_REFERENCES) {
-                sim->reference_string[sim->reference_string_len].pid = pid;
-                sim->reference_string[sim->reference_string_len].page_num = page;
-                sim->reference_string_len++;
-            } else {
-                strcat(log_output, "Warning: Reference string exceeded MAX_REFERENCES. Simulation truncated.\n");
-                goto end_reference_string_generation;
-            }
-        }
+    // Reset default parameters
+    sim->frame_size = 4; // Default frame size in KB
+    sim->defined_processes_count = 4; // Default number of defined processes
+    strcpy(sim->algorithm, "fifo");
+
+    for (int i = 0; i < MAX_UNIQUE_PAGES_TO_DEFINE; i++) {
+        sim->defined_process_kb_sizes[i] = 10; // Default process size in KB
+    }
+}
+
+
+// Executes a single step of the simulation
+bool simulator_single_step(Simulator *sim) {
+    if (sim->current_ref_idx >= sim->reference_string_len) {
+        return false; // Simulation complete
     }
 
-end_reference_string_generation:
-    strcat(log_output, "Reference String Generated. Total Accesses: ");
-    char ref_len_str[16];
-    sprintf(ref_len_str, "%d\n\n", sim->reference_string_len);
-    strcat(log_output, ref_len_str);
+    global_access_time++; // Increment global time for LRU/Optimal
 
-    // Simulate page accesses and apply page replacement logic
-    for (int i = 0; i < sim->reference_string_len; i++) {
-        global_access_time++;
-        int current_pid = sim->reference_string[i].pid;
-        int current_page = sim->reference_string[i].page_num;
+    ProcessReference current_ref = sim->reference_string[sim->current_ref_idx];
+    int requested_process_id = current_ref.process_id;
+    int requested_process_kb_size = current_ref.process_kb_size;
 
-        char current_access_msg[64];
-        snprintf(current_access_msg, sizeof(current_access_msg), "Accessing P%d, Page %d (Time %ld)\n",
-                 current_pid, current_page, global_access_time);
-        strcat(log_output, current_access_msg);
+    char log_msg[128];
+    snprintf(log_msg, sizeof(log_msg), "Step %d: Accessing Process ID %d (Size %d KB) (Time %ld)\n",
+             sim->current_ref_idx + 1, requested_process_id, requested_process_kb_size, global_access_time);
+    gui_log_message(log_msg);
 
-        if (is_page_in_memory(sim, current_pid, current_page) == -1) {
-            // Page fault → trigger page load and possible eviction
-            load_page(sim, current_pid, current_page, log_output, i);
+    // Check if the exact process is already in memory
+    int memory_idx = is_process_in_memory(sim, requested_process_id);
+
+    if (memory_idx != -1) {
+        sim->page_hits++;
+        sim->last_highlight_frame = sim->memory[memory_idx].frame;
+        sim->last_highlight_type = 1; // Blue highlight for hit
+
+        // Update last access time for LRU
+        if (strcmp(sim->algorithm, "lru") == 0) {
+            sim->memory[memory_idx].last_access_time = global_access_time;
+            // For LRU, move the accessed page to the end of the conceptual list (most recently used)
+            PageFrame hit_page = sim->memory[memory_idx];
+            for (int i = memory_idx; i < sim->memory_usage - 1; i++) {
+                sim->memory[i] = sim->memory[i + 1];
+            }
+            sim->memory[sim->memory_usage - 1] = hit_page;
+        }
+        gui_log_message("Page Hit: Process ID %d (Size %d KB) in Frame %d\n", requested_process_id, requested_process_kb_size, sim->memory[memory_idx].frame);
+    } else {
+        sim->page_faults++;
+        load_process(sim, requested_process_id, requested_process_kb_size, sim->current_ref_idx);
+    }
+
+    // Log current memory state
+    snprintf(log_msg, sizeof(log_msg), "Current Memory State: [");
+    char frame_status[64]; // Increased size for more info
+    for (int i = 0; i < FRAME_COUNT; i++) {
+        int found_in_mem_list_idx = -1;
+        for (int j = 0; j < sim->memory_usage; j++) {
+            if (sim->memory[j].occupied && sim->memory[j].frame == i) {
+                found_in_mem_list_idx = j;
+                break;
+            }
+        }
+
+        if (found_in_mem_list_idx != -1) {
+            snprintf(frame_status, sizeof(frame_status), "F%d:PID %d(S%dKB|T%ld)",
+                     sim->memory[found_in_mem_list_idx].frame,
+                     sim->memory[found_in_mem_list_idx].process_id,
+                     sim->memory[found_in_mem_list_idx].process_kb_size,
+                     sim->memory[found_in_mem_list_idx].last_access_time);
         } else {
-            // Page hit: already in memory
-            char msg[64];
-            snprintf(msg, sizeof(msg), "Access:   Process %d Page %d (In Memory)\n", current_pid, current_page);
-            strcat(log_output, msg);
+            snprintf(frame_status, sizeof(frame_status), "F%d:Empty", i);
         }
-
-        // Print memory state after each access
-        strcat(log_output, "Current Memory State: [");
-        for (int j = 0; j < FRAME_COUNT; j++) {
-            if (j < sim->memory_usage) {
-                char frame_info[32];
-                snprintf(frame_info, sizeof(frame_info), "F%d:P%d.P%d(T%ld)", 
-                         sim->memory[j].frame, sim->memory[j].process_id, 
-                         sim->memory[j].page, sim->memory[j].last_access_time);
-                strcat(log_output, frame_info);
-            } else {
-                strcat(log_output, "Empty");
-            }
-            if (j < FRAME_COUNT - 1) strcat(log_output, ", ");
+        strcat(log_msg, frame_status);
+        if (i < FRAME_COUNT - 1) {
+            strcat(log_msg, ", ");
         }
-        strcat(log_output, "]\n\n");
     }
+    strcat(log_msg, "]\n\n");
+    gui_log_message(log_msg);
+
+    gui_update_counters(sim->page_faults, sim->page_hits);
+
+    sim->current_ref_idx++;
+    return true; // Indicate that a step was executed
 }
